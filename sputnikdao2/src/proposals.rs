@@ -306,6 +306,7 @@ impl Contract {
         proposal_id: u64,
     ) -> PromiseOrValue<()> {
         let result = match &proposal.kind {
+            //match kind of proposal to execute
             ProposalKind::ChangeConfig { config } => {
                 self.config.set(config);
                 PromiseOrValue::Value(())
@@ -330,6 +331,7 @@ impl Contract {
                 receiver_id,
                 actions,
             } => {
+
                 let mut promise = Promise::new(receiver_id.clone().into());
                 for action in actions {
                     promise = promise.function_call(
@@ -532,7 +534,22 @@ impl Contract {
         self.locked_amount += env::attached_deposit();
         id
     }
-
+    pub fn transfer_from_contract(
+        &mut self,
+        from: &AccountId,
+        to: &AccountId,
+        amount: Balance,
+    ) -> Result<(), &'static str> {
+        let from_weight = self.get_user_weight(from);
+        let to_weight = self.get_user_weight(to);
+        if from_weight < amount {
+            return Err("not enough weight");
+        }
+        self.delegations.insert(from.clone(), from_weight - amount);
+        self.delegations.insert(to.clone(), to_weight + amount);
+        Ok(())
+    }
+    
     /// Act on given proposal by id, if permissions allow.
     /// Memo is logged but not stored in the state. Can be used to leave notes or explain the action.
     pub fn act_proposal(&mut self, id: u64, action: Action, memo: Option<String>) {
@@ -593,12 +610,35 @@ impl Contract {
                     policy.roles.iter().map(|r| r.name.clone()).collect(),
                     self.total_delegation_amount,
                 );
+
+                //! PAYOUTS:
+                let total_weight = self.total_delegation_amount;  // get total weight
+                let disaproved_weight = proposal.votes.iter().filter(|v| v.vote == Vote::Disapprove).map(|v| v.weight).sum::<u128>();
+                
+
+
+                //loop through all the votes, in each vote get the value of:
+                // ((weight of the vote)/(total_weight))*(the other's side total weight)
+                for vote in proposal.votes.iter() {
+                    let vote_weight_percentage =  (vote.weight as f64 / total_weight as f64);
+                    let payout = vote_weight_percentage * disaproved_weight;
+
+                    //pay the payout to the account
+                    let payout_account = vote.account_id.clone();
+                    let payout_amount = payout as u128;
+                    let payout_memo = format!("{} payout for {}", payout_amount, proposal.kind.to_string());
+                    self.transfer_from_contract(payout_account, payout_amount, payout_memo);
+                    
+                }
+
+                
                 match proposal.status {
                     ProposalStatus::Approved => {
-                        self.internal_execute_proposal(&policy, &proposal, id);
+                        self.internal_execute_proposal(&policy, &proposal, id); // first exec the proposal
                     }
                     ProposalStatus::Expired => {
                         self.internal_reject_proposal(&policy, &proposal, true);
+                        // get all the people who voted Expired on this proposal and pay them
                     }
                     _ => {
                         env::panic_str("ERR_PROPOSAL_NOT_EXPIRED_OR_FAILED");
@@ -606,7 +646,7 @@ impl Contract {
                 }
                 true
             }
-            Action::MoveToHub => false,
+            Action::MoveToHub => false, // Hub serves to "store" older Proposals
         };
         if update {
             self.proposals
@@ -616,6 +656,8 @@ impl Contract {
             log!("Memo: {}", memo);
         }
     }
+    
+    
 
     /// Receiving callback after the proposal has been finalized.
     /// If successful, returns bond money to the proposal originator.
